@@ -1,5 +1,5 @@
 # Мониторинг позиций - Отдельное приложение
-# Версия 1.3 (Исправленная)
+# Версия 1.4 (Final Fix)
 # Дата: 13 февраля 2026
 
 import streamlit as st
@@ -7,10 +7,15 @@ import pandas as pd
 import numpy as np
 import ccxt
 from statsmodels.tsa.stattools import coint
-import statsmodels.api as sm  # Добавлено для расчета Hedge Ratio
+import statsmodels.api as sm
 import time
 from datetime import datetime
 import plotly.graph_objects as go
+
+# --- КОНСТАНТЫ ---
+# Примерный % движения цены при изменении Z-score на 1.0 (для расчета PnL)
+# 1.5% - консервативная оценка для альткоинов без плеча
+VOLATILITY_FACTOR = 1.5 
 
 # Настройка страницы
 st.set_page_config(
@@ -31,34 +36,43 @@ st.markdown("""
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
     }
+    .stMetric {
+        background-color: #f0f2f6;
+        padding: 10px;
+        border-radius: 10px;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 24px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # Заголовок
 st.markdown('<p class="main-header">📊 Мониторинг Открытых Позиций</p>', unsafe_allow_html=True)
-st.caption("Версия 1.3 | Обновлено: 13 февраля 2026 | Исправлена ошибка расчета Hedge Ratio")
+st.caption("Версия 1.4 | Исправлен расчет PnL и добавлены графики")
 st.markdown("---")
 
-# Session state для позиций
+# Session state
 if 'positions' not in st.session_state:
     st.session_state.positions = []
 
-# Sidebar - добавление позиций
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("➕ Добавить позицию")
     
     col1, col2 = st.columns(2)
     with col1:
-        coin1 = st.text_input("Монета 1 (LONG)", value="BTC", key="add_coin1")
+        coin1 = st.text_input("Монета 1 (LONG)", value="TNSR", key="add_coin1")
     with col2:
-        coin2 = st.text_input("Монета 2 (SHORT)", value="ETH", key="add_coin2")
+        coin2 = st.text_input("Монета 2 (SHORT)", value="ME", key="add_coin2")
     
     entry_z = st.number_input(
         "Z-score входа",
-        min_value=-5.0,
-        max_value=5.0,
+        min_value=-10.0,
+        max_value=10.0,
         value=-2.3,
-        step=0.1
+        step=0.1,
+        help="Значение Z-score, при котором вы открыли сделку"
     )
     
     position_size = st.number_input(
@@ -84,244 +98,224 @@ with st.sidebar:
         st.rerun()
     
     st.markdown("---")
-    
-    # Настройки
     st.header("⚙️ Настройки")
     
-    exchange_name = st.selectbox(
-        "Биржа",
-        ['binance', 'bybit', 'okx'],
-        index=2  # OKX по умолчанию
-    )
+    exchange_name = st.selectbox("Биржа", ['binance', 'bybit', 'okx'], index=2)
     
     auto_refresh = st.checkbox("Автообновление", value=False)
-    
     if auto_refresh:
-        refresh_interval = st.slider(
-            "Интервал обновления (мин)",
-            min_value=1,
-            max_value=60,
-            value=5
-        )
+        refresh_interval = st.slider("Интервал (мин)", 1, 60, 5)
     
-    # Кнопка обновления
     if st.button("🔄 Обновить сейчас", use_container_width=True):
         st.rerun()
 
-# Функция расчета Z-score (ИСПРАВЛЕННАЯ)
-@st.cache_data(ttl=300)  # Кеш на 5 минут
-def calculate_zscore(exchange_name, coin1, coin2):
-    """Рассчитать текущий Z-score для пары"""
+# --- ФУНКЦИЯ РАСЧЕТА ---
+@st.cache_data(ttl=300)
+def calculate_metrics(exchange_name, coin1, coin2):
+    """Считает Z-score, возвращает историю для графика"""
     try:
-        # Инициализация биржи
         exchange = getattr(ccxt, exchange_name)()
+        c1, c2 = coin1.upper(), coin2.upper()
         
-        # Приводим тикеры к верхнему регистру для надежности
-        c1 = coin1.upper()
-        c2 = coin2.upper()
-        
-        # Пробуем разные варианты символов
+        # Варианты тикеров
         symbol_variants = [
             (f"{c1}/USDT", f"{c2}/USDT"),
-            (f"{c1}/USDT:USDT", f"{c2}/USDT:USDT"),  # Futures
-            (f"{c1}-USDT", f"{c2}-USDT"), # Alternative formatting
+            (f"{c1}-USDT", f"{c2}-USDT"),
+            (f"{c1}/USDT:USDT", f"{c2}/USDT:USDT"),
         ]
         
-        prices1 = None
-        prices2 = None
+        prices1, prices2 = None, None
         
-        # Попытка загрузить данные
         for sym1, sym2 in symbol_variants:
             try:
-                ohlcv1 = exchange.fetch_ohlcv(sym1, '4h', limit=210)  # ~35 дней
-                ohlcv2 = exchange.fetch_ohlcv(sym2, '4h', limit=210)
+                # Берем больше свечей для красивого графика
+                ohlcv1 = exchange.fetch_ohlcv(sym1, '4h', limit=300)
+                ohlcv2 = exchange.fetch_ohlcv(sym2, '4h', limit=300)
                 
-                if not ohlcv1 or not ohlcv2:
-                    continue
+                if not ohlcv1 or not ohlcv2: continue
 
-                p1_raw = [x[4] for x in ohlcv1]
-                p2_raw = [x[4] for x in ohlcv2]
+                p1 = [x[4] for x in ohlcv1]
+                p2 = [x[4] for x in ohlcv2]
+                dates = [datetime.fromtimestamp(x[0]/1000) for x in ohlcv1]
                 
-                # Выравниваем длину массивов (критично для расчетов)
-                min_len = min(len(p1_raw), len(p2_raw))
-                if min_len < 20: # Слишком мало данных
-                    continue
+                min_len = min(len(p1), len(p2))
+                if min_len < 50: continue
                     
-                prices1 = np.array(p1_raw[-min_len:])
-                prices2 = np.array(p2_raw[-min_len:])
+                prices1 = np.array(p1[-min_len:])
+                prices2 = np.array(p2[-min_len:])
+                dates = dates[-min_len:]
                 break
             except:
                 continue
         
-        if prices1 is None or prices2 is None:
-            return None
+        if prices1 is None: return None
         
-        # --- ИСПРАВЛЕНИЕ: Расчет Hedge Ratio через OLS ---
+        # OLS Hedge Ratio
         x = sm.add_constant(prices2)
         model = sm.OLS(prices1, x)
         results = model.fit()
         hedge_ratio = results.params[1]
         
-        # Спред
+        # Спред и Z-score (Векторный расчет)
         spread = prices1 - hedge_ratio * prices2
-        
-        # Z-score
-        z_score = (spread[-1] - spread.mean()) / spread.std()
-        
-        # Текущие цены
-        current_price1 = prices1[-1]
-        current_price2 = prices2[-1]
+        mean = spread.mean()
+        std = spread.std()
+        z_score_series = (spread - mean) / std
         
         return {
-            'z_score': z_score,
-            'hedge_ratio': hedge_ratio,
-            'price1': current_price1,
-            'price2': current_price2,
-            'spread': spread
+            'current_z': z_score_series[-1],
+            'z_history': z_score_series,
+            'dates': dates,
+            'price1': prices1[-1],
+            'price2': prices2[-1]
         }
     except Exception as e:
-        # Логируем ошибку в консоль, чтобы не засорять UI, если это не критично
-        print(f"Error calculating Z-score for {coin1}/{coin2}: {e}")
+        print(f"Error: {e}")
         return None
 
-# Главный интерфейс
+# --- ГЛАВНЫЙ ЭКРАН ---
 if len(st.session_state.positions) == 0:
-    st.info("""
-    📊 **Добро пожаловать в мониторинг позиций!**
-    
-    Используйте sidebar слева чтобы добавить свои открытые позиции.
-    
-    **Возможности:**
-    - Мониторинг Z-score в реальном времени
-    - Автоматические алерты на выход
-    - Расчет текущей прибыли/убытка
-    - Рекомендации по стоп-лоссу
-    - Прогресс к цели
-    """)
+    st.info("👋 Добавьте позиции через меню слева.")
 else:
-    # Таблица статуса
-    st.markdown("### 📊 Таблица статуса позиций")
+    st.markdown("### 📊 Статус позиций")
     
     positions_data = []
     
-    # Сначала собираем данные
+    # 1. Сбор данных
     for i, pos in enumerate(st.session_state.positions):
-        if pos['status'] != 'active':
-            continue
+        if pos['status'] != 'active': continue
         
-        # Рассчитываем Z-score
-        result = calculate_zscore(exchange_name, pos['coin1'], pos['coin2'])
+        data = calculate_metrics(exchange_name, pos['coin1'], pos['coin2'])
         
-        if result:
-            current_z = result['z_score']
+        if data:
+            curr_z = data['current_z']
             entry_z = pos['entry_z']
             
-            # Определяем статус
-            if abs(current_z) < 0.5:
-                status = "🎯 ВЫХОДИТЬ!"
-            elif abs(current_z) < 1.0:
+            # --- ЛОГИКА СТАТУСА ---
+            # Цель всегда 0 (средняя). 
+            # Чем ближе к 0, тем лучше (если идем от входа).
+            dist_to_mean = abs(curr_z)
+            
+            if dist_to_mean < 0.3:
+                status = "💰 ЗАКРЫВАТЬ"
+                status_color = "green"
+            elif dist_to_mean < 1.0:
                 status = "⚠️ Близко"
-            elif abs(current_z) > 3.5:
-                status = "🚨 ОПАСНО!"
+                status_color = "orange"
+            elif dist_to_mean > 3.5:
+                status = "🚨 ОПАСНО"
+                status_color = "red"
             else:
                 status = "✅ Держим"
+                status_color = "blue"
+
+            # --- ИСПРАВЛЕННАЯ ЛОГИКА ПРИБЫЛИ ---
+            # 1. Считаем дельту "пройденного пути" по модулю
+            # Если Entry = -2.3, Current = -1.0 -> прошли 1.3 (Прибыль)
+            # Если Entry = -2.3, Current = -3.0 -> ушли назад на 0.7 (Убыток)
+            z_delta = abs(entry_z) - abs(curr_z)
             
-            # Расчет прибыли
-            if entry_z < 0:  # LONG Spread (Вход снизу)
-                profit_pct = ((abs(entry_z) - abs(current_z)) / abs(entry_z)) * 100
-            else:  # SHORT Spread (Вход сверху)
-                profit_pct = ((abs(current_z) - abs(entry_z)) / abs(entry_z)) * 100
+            # 2. Считаем % PnL
+            # Используем коэффициент: 1 Z-score ~= 1.5% PnL (VOLATILITY_FACTOR)
+            pnl_percent = z_delta * VOLATILITY_FACTOR
             
-            profit_usd = pos['size'] * (profit_pct / 100) * 0.7  # Hedge efficiency estimate
+            # 3. Считаем $ PnL
+            pnl_usd = pos['size'] * (pnl_percent / 100)
             
             positions_data.append({
-                'Пара': pos['pair'],
-                'Вход Z': round(entry_z, 2),
-                'Текущий Z': round(current_z, 2),
-                'Статус': status,
-                'Прибыль %': round(profit_pct, 2),
-                'Прибыль $': round(profit_usd, 2)
+                'id': i,
+                'pair': pos['pair'],
+                'entry_z': entry_z,
+                'curr_z': curr_z,
+                'status': status,
+                'pnl_pct': pnl_percent,
+                'pnl_usd': pnl_usd,
+                'data': data # сохраняем для детального view
             })
         else:
-            positions_data.append({
-                'Пара': pos['pair'],
-                'Вход Z': round(pos['entry_z'], 2),
-                'Текущий Z': '❌',
-                'Статус': 'Ошибка',
-                'Прибыль %': '-',
-                'Прибыль $': '-'
-            })
-    
-    # Отображаем таблицу
+             positions_data.append({'id': i, 'pair': pos['pair'], 'error': True})
+
+    # 2. Отрисовка таблицы (Custom)
     if positions_data:
-        df = pd.DataFrame(positions_data)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    
-    # Детальная информация
-    st.markdown("---")
-    st.markdown("### 📋 Детальная информация")
-    
-    # Используем копию списка для безопасного удаления элементов во время итерации
-    # Но для UI лучше просто обновлять стейт
-    
-    for i, pos in enumerate(st.session_state.positions):
-        if pos['status'] != 'active':
-            continue
+        # Заголовки таблицы
+        c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 2, 2])
+        c1.write("**Пара**")
+        c2.write("**Вход Z**")
+        c3.write("**Тек. Z**")
+        c4.write("**Статус**")
+        c5.write("**Прибыль**")
+        st.divider()
         
-        with st.expander(f"📊 {pos['pair']}", expanded=False):
-            result = calculate_zscore(exchange_name, pos['coin1'], pos['coin2'])
+        for p in positions_data:
+            if 'error' in p:
+                st.error(f"❌ Ошибка данных для {p['pair']}")
+                continue
+                
+            c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 2, 2])
+            c1.write(f"**{p['pair']}**")
+            c2.write(f"{p['entry_z']:.2f}")
+            c3.write(f"{p['curr_z']:.2f}")
+            c4.write(p['status'])
             
-            if result:
-                current_z = result['z_score']
-                entry_z = pos['entry_z']
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("Текущий Z", f"{current_z:.2f}")
-                    if abs(current_z) < 0.5:
-                        st.success("🎯 ВЫХОДИТЬ!")
-                
-                with col2:
-                    if entry_z < 0:
-                        profit_pct = ((abs(entry_z) - abs(current_z)) / abs(entry_z)) * 100
-                    else:
-                        profit_pct = ((abs(current_z) - abs(entry_z)) / abs(entry_z)) * 100
-                    
-                    profit_usd = pos['size'] * (profit_pct / 100) * 0.7
-                    st.metric("Прибыль", f"${profit_usd:.2f}", f"{profit_pct:.2f}%")
-                
-                with col3:
-                    stop_z = entry_z - 1.0 if entry_z < 0 else entry_z + 1.0
-                    st.metric("Стоп", f"{stop_z:.2f}")
-                
-                with col4:
-                    progress = 1 - (abs(current_z) / abs(entry_z))
-                    progress = max(0, min(1, progress))
-                    st.metric("Прогресс", f"{progress*100:.1f}%")
-                
-                st.progress(progress, f"К цели: {progress*100:.1f}%")
-                
-                # Кнопки управления
-                col_a1, col_a2 = st.columns(2)
-                with col_a1:
-                    if st.button(f"✅ Закрыть позицию", key=f"close_{i}"):
-                        st.session_state.positions[i]['status'] = 'closed'
-                        st.rerun()
-                with col_a2:
-                    if st.button(f"🗑️ Удалить из списка", key=f"remove_{i}"):
-                        st.session_state.positions.pop(i)
-                        st.rerun()
-            else:
-                st.warning("Данные недоступны. Проверьте тикеры или подключение к бирже.")
-                if st.button(f"🗑️ Удалить ошибочную", key=f"remove_err_{i}"):
-                     st.session_state.positions.pop(i)
-                     st.rerun()
+            # Цвет прибыли
+            pnl_color = "green" if p['pnl_usd'] >= 0 else "red"
+            c5.markdown(f":{pnl_color}[**${p['pnl_usd']:.2f} ({p['pnl_pct']:.2f}%)**]")
+            st.divider()
+
+    # 3. Детальная информация с графиками
+    st.markdown("### 📈 Детальная аналитика")
+    
+    for p in positions_data:
+        if 'error' in p: continue
+        
+        with st.expander(f"График {p['pair']} | PnL: ${p['pnl_usd']:.2f}", expanded=False):
+            data = p['data']
+            
+            # Построение графика Plotly
+            fig = go.Figure()
+            
+            # Линия Z-score
+            fig.add_trace(go.Scatter(
+                x=data['dates'], 
+                y=data['z_history'],
+                mode='lines',
+                name='Z-Score',
+                line=dict(color='#636efa', width=2)
+            ))
+            
+            # Линии уровней
+            fig.add_hline(y=0, line_dash="dash", line_color="gray", annotation_text="Mean (0)")
+            fig.add_hline(y=2, line_dash="dot", line_color="red", opacity=0.5)
+            fig.add_hline(y=-2, line_dash="dot", line_color="green", opacity=0.5)
+            
+            # Линия входа
+            fig.add_hline(
+                y=p['entry_z'], 
+                line_color="orange", 
+                line_width=2, 
+                annotation_text=f"Вход: {p['entry_z']}",
+                annotation_position="bottom right"
+            )
+            
+            fig.update_layout(
+                title=f"Z-Score Динамика: {p['pair']}",
+                xaxis_title="Время",
+                yaxis_title="Z-Score",
+                height=400,
+                margin=dict(l=20, r=20, t=40, b=20),
+                template="plotly_dark"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Кнопки управления
+            col_btn1, col_btn2 = st.columns([1, 4])
+            with col_btn1:
+                if st.button(f"🗑️ Удалить {p['pair']}", key=f"del_{p['id']}"):
+                    st.session_state.positions.pop(p['id'])
+                    st.rerun()
 
 # Автообновление
 if auto_refresh and len(st.session_state.positions) > 0:
     time.sleep(refresh_interval * 60)
     st.rerun()
-
-st.markdown("---")
-st.caption("⚠️ Этот инструмент для мониторинга. Не финансовая рекомендация.")
