@@ -1,12 +1,13 @@
 # Мониторинг позиций - Отдельное приложение
-# Версия 1.0
-# Дата: 11 февраля 2026
+# Версия 1.3 (Исправленная)
+# Дата: 13 февраля 2026
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import ccxt
 from statsmodels.tsa.stattools import coint
+import statsmodels.api as sm  # Добавлено для расчета Hedge Ratio
 import time
 from datetime import datetime
 import plotly.graph_objects as go
@@ -35,7 +36,7 @@ st.markdown("""
 
 # Заголовок
 st.markdown('<p class="main-header">📊 Мониторинг Открытых Позиций</p>', unsafe_allow_html=True)
-st.caption("Версия 1.2 | Обновлено: 13 февраля 2026 | Улучшенная обработка ошибок")
+st.caption("Версия 1.3 | Обновлено: 13 февраля 2026 | Исправлена ошибка расчета Hedge Ratio")
 st.markdown("---")
 
 # Session state для позиций
@@ -107,7 +108,7 @@ with st.sidebar:
     if st.button("🔄 Обновить сейчас", use_container_width=True):
         st.rerun()
 
-# Функция расчета Z-score
+# Функция расчета Z-score (ИСПРАВЛЕННАЯ)
 @st.cache_data(ttl=300)  # Кеш на 5 минут
 def calculate_zscore(exchange_name, coin1, coin2):
     """Рассчитать текущий Z-score для пары"""
@@ -115,23 +116,39 @@ def calculate_zscore(exchange_name, coin1, coin2):
         # Инициализация биржи
         exchange = getattr(ccxt, exchange_name)()
         
+        # Приводим тикеры к верхнему регистру для надежности
+        c1 = coin1.upper()
+        c2 = coin2.upper()
+        
         # Пробуем разные варианты символов
         symbol_variants = [
-            (f"{coin1}/USDT", f"{coin2}/USDT"),
-            (f"{coin1}/USDT:USDT", f"{coin2}/USDT:USDT"),  # Futures
-            (f"{coin1.upper()}/USDT", f"{coin2.upper()}/USDT"),
+            (f"{c1}/USDT", f"{c2}/USDT"),
+            (f"{c1}/USDT:USDT", f"{c2}/USDT:USDT"),  # Futures
+            (f"{c1}-USDT", f"{c2}-USDT"), # Alternative formatting
         ]
         
         prices1 = None
         prices2 = None
         
+        # Попытка загрузить данные
         for sym1, sym2 in symbol_variants:
             try:
-                ohlcv1 = exchange.fetch_ohlcv(sym1, '4h', limit=210)  # 35 дней
+                ohlcv1 = exchange.fetch_ohlcv(sym1, '4h', limit=210)  # ~35 дней
                 ohlcv2 = exchange.fetch_ohlcv(sym2, '4h', limit=210)
                 
-                prices1 = np.array([x[4] for x in ohlcv1])
-                prices2 = np.array([x[4] for x in ohlcv2])
+                if not ohlcv1 or not ohlcv2:
+                    continue
+
+                p1_raw = [x[4] for x in ohlcv1]
+                p2_raw = [x[4] for x in ohlcv2]
+                
+                # Выравниваем длину массивов (критично для расчетов)
+                min_len = min(len(p1_raw), len(p2_raw))
+                if min_len < 20: # Слишком мало данных
+                    continue
+                    
+                prices1 = np.array(p1_raw[-min_len:])
+                prices2 = np.array(p2_raw[-min_len:])
                 break
             except:
                 continue
@@ -139,8 +156,11 @@ def calculate_zscore(exchange_name, coin1, coin2):
         if prices1 is None or prices2 is None:
             return None
         
-        # Коинтеграция
-        score, pvalue, (hedge_ratio,) = coint(prices1, prices2)
+        # --- ИСПРАВЛЕНИЕ: Расчет Hedge Ratio через OLS ---
+        x = sm.add_constant(prices2)
+        model = sm.OLS(prices1, x)
+        results = model.fit()
+        hedge_ratio = results.params[1]
         
         # Спред
         spread = prices1 - hedge_ratio * prices2
@@ -155,13 +175,13 @@ def calculate_zscore(exchange_name, coin1, coin2):
         return {
             'z_score': z_score,
             'hedge_ratio': hedge_ratio,
-            'pvalue': pvalue,
             'price1': current_price1,
             'price2': current_price2,
             'spread': spread
         }
     except Exception as e:
-        st.warning(f"⚠️ Не удалось получить данные для {coin1}/{coin2}: {str(e)}")
+        # Логируем ошибку в консоль, чтобы не засорять UI, если это не критично
+        print(f"Error calculating Z-score for {coin1}/{coin2}: {e}")
         return None
 
 # Главный интерфейс
@@ -184,6 +204,7 @@ else:
     
     positions_data = []
     
+    # Сначала собираем данные
     for i, pos in enumerate(st.session_state.positions):
         if pos['status'] != 'active':
             continue
@@ -206,12 +227,12 @@ else:
                 status = "✅ Держим"
             
             # Расчет прибыли
-            if entry_z < 0:  # LONG
+            if entry_z < 0:  # LONG Spread (Вход снизу)
                 profit_pct = ((abs(entry_z) - abs(current_z)) / abs(entry_z)) * 100
-            else:  # SHORT
+            else:  # SHORT Spread (Вход сверху)
                 profit_pct = ((abs(current_z) - abs(entry_z)) / abs(entry_z)) * 100
             
-            profit_usd = pos['size'] * (profit_pct / 100) * 0.7  # Hedge efficiency
+            profit_usd = pos['size'] * (profit_pct / 100) * 0.7  # Hedge efficiency estimate
             
             positions_data.append({
                 'Пара': pos['pair'],
@@ -239,6 +260,9 @@ else:
     # Детальная информация
     st.markdown("---")
     st.markdown("### 📋 Детальная информация")
+    
+    # Используем копию списка для безопасного удаления элементов во время итерации
+    # Но для UI лучше просто обновлять стейт
     
     for i, pos in enumerate(st.session_state.positions):
         if pos['status'] != 'active':
@@ -278,16 +302,21 @@ else:
                 
                 st.progress(progress, f"К цели: {progress*100:.1f}%")
                 
-                # Кнопки
+                # Кнопки управления
                 col_a1, col_a2 = st.columns(2)
                 with col_a1:
-                    if st.button(f"✅ Закрыть", key=f"close_{i}"):
+                    if st.button(f"✅ Закрыть позицию", key=f"close_{i}"):
                         st.session_state.positions[i]['status'] = 'closed'
                         st.rerun()
                 with col_a2:
-                    if st.button(f"🗑️ Удалить", key=f"remove_{i}"):
+                    if st.button(f"🗑️ Удалить из списка", key=f"remove_{i}"):
                         st.session_state.positions.pop(i)
                         st.rerun()
+            else:
+                st.warning("Данные недоступны. Проверьте тикеры или подключение к бирже.")
+                if st.button(f"🗑️ Удалить ошибочную", key=f"remove_err_{i}"):
+                     st.session_state.positions.pop(i)
+                     st.rerun()
 
 # Автообновление
 if auto_refresh and len(st.session_state.positions) > 0:
